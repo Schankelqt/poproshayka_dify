@@ -14,23 +14,8 @@ services:
       - key: DIFY_API_KEY
         sync: false
       - key: DIFY_API_URL
+        value: https://api.dify.ai/v1
+      - key: REDIS_URL            # из Render Key Value (Internal URL)
         sync: false
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: poproshayka-redis
-          property: connectionString
-      - key: DATABASE_URL
-        fromService:
-          type: postgres
-          name: poproshayka-postgres
-          property: connectionString
-
-  - type: redis
-    name: poproshayka-redis
-    ipAllowList: []   # закрытый доступ
-
-  - type: postgres
-    name: poproshayka-postgres
-    plan: free
-    ipAllowList: []   # закрытый доступ
+      - key: DATABASE_URL         # из Render Postgres (Internal Database URL)
+        sync: false
