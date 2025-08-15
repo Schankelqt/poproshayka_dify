@@ -1,0 +1,10 @@
+flask
+requests
+python-dotenv
+gunicorn
+
+redis
+SQLAlchemy>=2.0
+psycopg[binary]
+
+schedule
