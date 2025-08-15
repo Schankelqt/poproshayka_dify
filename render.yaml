@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: poproshayka-web
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -c gunicorn.conf.py main:app
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: DIFY_API_KEY
+        sync: false
+      - key: DIFY_API_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+
+  - type: worker
+    name: poproshayka-scheduler
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scheduler.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: DIFY_API_KEY
+        sync: false
+      - key: DIFY_API_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
