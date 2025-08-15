@@ -1,133 +1,287 @@
 from flask import Flask, request
-import requests, logging, json
+import requests, json, os, logging
 from dotenv import dotenv_values
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
+from datetime import datetime, date
+from users import USERS, TEAMS
 
-from users import USERS
-from storage import save_answer, get_conversation_id as r_get_conv, set_conversation_id as r_set_conv
+import redis
+import psycopg2
+import psycopg2.extras
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
-log = logging.getLogger(__name__)
+# ---------- логирование ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("poproshayka")
 
-env = dotenv_values(".env")  # локально; на Render переменные берутся из окружения
+# ---------- ENV ----------
+env = {**dotenv_values(".env"), **os.environ}
 TELEGRAM_TOKEN = env.get("TELEGRAM_TOKEN")
-DIFY_API_KEY = env.get("DIFY_API_KEY")
-DIFY_API_URL = env.get("DIFY_API_URL", "").rstrip('/')
+DIFY_API_KEY   = env.get("DIFY_API_KEY")
+DIFY_API_URL   = (env.get("DIFY_API_URL") or "").rstrip("/")
+REDIS_URL      = env.get("REDIS_URL")
+DATABASE_URL   = env.get("DATABASE_URL")
+TZ             = pytz.timezone(os.getenv("TZ", "Europe/Moscow"))
 
+# ---------- Flask ----------
 app = Flask(__name__)
 
-def fetch_conversations_from_dify(chat_id: int):
-    """Если conv_id не найден в Redis — спрашиваем Dify список разговоров пользователя."""
-    url = f"{DIFY_API_URL}/conversations"
-    headers = {"Authorization": f"Bearer {DIFY_API_KEY}"}
-    params = {"user": str(chat_id)}
+# ---------- Redis ----------
+rds = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+
+def redis_key_for(d: date) -> str:
+    return f"answers:{d.isoformat()}"  # Hash: field=str(chat_id) -> JSON {"name","summary"}
+
+def clear_today_answers():
+    if not rds: 
+        return
+    rds.delete(redis_key_for(datetime.now(TZ).date()))
+
+def save_answer_to_redis(chat_id: int, name: str, summary: str):
+    if not rds:
+        return
+    key = redis_key_for(datetime.now(TZ).date())
+    rds.hset(key, str(chat_id), json.dumps({"name": name, "summary": summary}, ensure_ascii=False))
+
+def load_answers_from_redis(for_date: date) -> dict:
+    """Возвращает dict[str(chat_id)] = {"name","summary"}"""
+    if not rds:
+        return {}
+    key = redis_key_for(for_date)
+    raw = rds.hgetall(key)
+    out = {}
+    for k, v in raw.items():
+        try:
+            out[k] = json.loads(v)
+        except Exception:
+            pass
+    return out
+
+# ---------- Postgres ----------
+pg_conn = None
+if DATABASE_URL:
+    pg_conn = psycopg2.connect(DATABASE_URL)
+    pg_conn.autocommit = True
+
+def pg_init():
+    if not pg_conn:
+        return
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS answers (
+          id          bigserial PRIMARY KEY,
+          day         date        NOT NULL,
+          chat_id     bigint      NOT NULL,
+          user_name   text        NOT NULL,
+          summary     text        NOT NULL,
+          created_at  timestamptz NOT NULL DEFAULT now(),
+          updated_at  timestamptz NOT NULL DEFAULT now()
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_answers_day_chat
+          ON answers(day, chat_id);
+        """)
+pg_init()
+
+def pg_upsert_answer(day: date, chat_id: int, user_name: str, summary: str):
+    if not pg_conn:
+        return
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO answers(day, chat_id, user_name, summary)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (day, chat_id)
+        DO UPDATE SET user_name = EXCLUDED.user_name,
+                      summary   = EXCLUDED.summary,
+                      updated_at= now();
+        """, (day, chat_id, user_name, summary))
+
+# ---------- Dify helpers ----------
+def tg_send(chat_id: int, text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    r = requests.post(url, json={"chat_id": chat_id, "text": text})
+    if not r.ok:
+        log.error("Telegram send error %s: %s", r.status_code, r.text)
+    return r
+
+conversation_ids = {}  # { chat_id: conversation_id }
+
+def get_conversation_id(chat_id):
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        log.info(f"[Dify] conversations for {chat_id}: {data}")
+        url = f"{DIFY_API_URL}/conversations"
+        headers = {"Authorization": f"Bearer {DIFY_API_KEY}"}
+        params = {"user": str(chat_id)}
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        log.info("[Dify] conversations for %s: %s", chat_id, data)
         if data.get("data"):
             return data["data"][0]["id"]
     except Exception as e:
-        log.error(f"[Dify] get conversations error: {e}")
+        log.error("get_conversation_id error for %s: %s", chat_id, e)
     return None
 
-def clean_summary(answer_text: str) -> str:
-    """
-    Удаляем всё выше 'sum' и саму строку 'sum', оставляем строки ниже.
-    """
-    if not answer_text:
-        return ""
+def send_to_dify(payload):
+    try:
+        headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
+        url = f"{DIFY_API_URL}/chat-messages"
+        log.info("[Dify] request: %s", json.dumps(payload, ensure_ascii=False))
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        log.info("[Dify] status=%s body=%s", r.status_code, r.text)
+        return r
+    except Exception as e:
+        log.error("send_to_dify exception: %s", e)
+        return None
+
+def extract_summary(answer_text: str) -> str | None:
     lower = answer_text.lower()
     pos = lower.find("sum")
     if pos == -1:
-        return answer_text.strip()
-    tail = answer_text[pos:]
-    lines = tail.splitlines()
-    if not lines:
-        return ""
-    return "\n".join(lines[1:]).strip()
+        return None
+    after = answer_text[pos:]
+    lines = after.splitlines()
+    if lines:
+        return "\n".join(lines[1:]).strip()
+    return answer_text[pos:].strip()
 
-@app.route("/health", methods=["GET"])
-def health():
-    return {"status": "ok"}, 200
-
+# ---------- Telegram webhook ----------
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
     data = request.get_json()
-    log.info(f"✅ Webhook: {data}")
+    log.info("Webhook data: %s", data)
 
-    if not data or "message" not in data or "text" not in data["message"]:
+    if not (data and "message" in data and "text" in data["message"]):
         return "ok"
 
     chat_id = data["message"]["chat"]["id"]
-    user_message = data["message"]["text"]
+    user_msg = data["message"]["text"]
     user_name = USERS.get(chat_id, "Неизвестный")
 
-    # 1) conv_id: сначала из Redis, иначе из Dify
-    conv_id = r_get_conv(chat_id)
+    conv_id = conversation_ids.get(chat_id)
     if not conv_id:
-        conv_id = fetch_conversations_from_dify(chat_id)
+        conv_id = get_conversation_id(chat_id)
         if conv_id:
-            r_set_conv(chat_id, conv_id)
-
-    headers = {
-        "Authorization": f"Bearer {DIFY_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    def send_to_dify(payload):
-        try:
-            resp = requests.post(f"{DIFY_API_URL}/chat-messages", headers=headers, json=payload, timeout=60)
-            log.info(f"[Dify] Status: {resp.status_code}, Body: {resp.text}")
-            return resp
-        except Exception as e:
-            log.error(f"[Dify] request error: {e}")
-            return None
+            conversation_ids[chat_id] = conv_id
+        else:
+            log.info("No conversation for %s, will create new", chat_id)
 
     payload = {
         "inputs": {},
-        "query": user_message,
+        "query": user_msg,
         "response_mode": "blocking",
         "user": str(chat_id),
     }
     if conv_id:
         payload["conversation_id"] = conv_id
 
-    response = send_to_dify(payload)
+    resp = send_to_dify(payload)
 
-    # 404: «Conversation Not Exists.» — создаём новую
-    if response is not None and response.status_code == 404:
-        log.info(f"[Dify] conversation {conv_id} not exists, creating new...")
+    if resp is not None and resp.status_code == 404:
         payload.pop("conversation_id", None)
-        response = send_to_dify(payload)
-        if response is not None and response.status_code == 200:
-            new_conv_id = response.json().get("conversation_id")
-            if new_conv_id:
-                r_set_conv(chat_id, new_conv_id)
-                log.info(f"[Dify] new conversation_id: {new_conv_id}")
+        resp = send_to_dify(payload)
+        if resp is not None and resp.status_code == 200:
+            new_conv = resp.json().get("conversation_id")
+            if new_conv:
+                conversation_ids[chat_id] = new_conv
+                log.info("New conversation for %s: %s", chat_id, new_conv)
 
-    # Ответ пользователю + сохранение sum
-    if response is not None and response.status_code == 200:
-        answer_text = response.json().get("answer", "")
-        if "sum" in answer_text.lower():
-            summary = clean_summary(answer_text)
-            save_answer(chat_id, user_name, summary)
-            reply = summary if summary else "Итог зафиксирован."
+    if resp is not None and resp.status_code == 200:
+        answer = resp.json().get("answer", "")
+        summary = extract_summary(answer)
+        if summary:
+            # сохраняем в Redis (день): и в Postgres (история)
+            today = datetime.now(TZ).date()
+            save_answer_to_redis(chat_id, user_name, summary)
+            pg_upsert_answer(today, chat_id, user_name, summary)
+            tg_send(chat_id, summary)
         else:
-            reply = answer_text
+            tg_send(chat_id, answer)
     else:
-        reply = f"⚠️ Ошибка при обращении к Dify: {response.status_code if response else 'нет ответа'}"
-
-    # Telegram send
-    send_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        tg = requests.post(send_url, json={"chat_id": chat_id, "text": reply}, timeout=30)
-        log.info(f"[Telegram] Status: {tg.status_code}, Body: {tg.text}")
-    except Exception as e:
-        log.error(f"[Telegram] send error: {e}")
+        tg_send(chat_id, f"⚠️ Ошибка при обращении к Dify: {resp.status_code if resp else 'нет ответа'}")
 
     return "ok"
 
-if __name__ == "__main__":
-    # Локальный запуск (на Render стартует gunicorn из render.yaml)
-    app.run(host="0.0.0.0", port=5001)
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+# ---------- Рассылка/отчёты ----------
+QUESTION_TEXT_WORKDAY = (
+    "Доброе утро! ☀️\n\n"
+    "Пожалуйста, ответьте на 3 вопроса:\n"
+    "1. Что делали вчера?\n"
+    "2. Что планируете сегодня?\n"
+    "3. Есть ли блокеры?"
+)
+QUESTION_TEXT_MONDAY = (
+    "Доброе утро! ☀️\n\n"
+    "Пожалуйста, ответьте на 3 вопроса:\n"
+    "1. Что делали в пятницу?\n"
+    "2. Что планируете сегодня?\n"
+    "3. Есть ли блокеры?"
+)
+
+def send_questions():
+    weekday = datetime.now(TZ).weekday()  # Mon=0..Sun=6
+    text = QUESTION_TEXT_MONDAY if weekday == 0 else QUESTION_TEXT_WORKDAY
+    log.info("Рассылка вопросов (weekday=%s)", weekday)
+
+    clear_today_answers()  # очищаем дневной буфер
+
+    for team_id, team_data in TEAMS.items():
+        for chat_id, name in team_data["members"].items():
+            try:
+                r = tg_send(chat_id, text)
+                if r.ok:
+                    log.info("Вопрос отправлен: %s (%s)", name, chat_id)
+                else:
+                    log.error("Ошибка отправки вопроса %s (%s): %s %s",
+                              name, chat_id, r.status_code, r.text)
+            except Exception as e:
+                log.error("Исключение при отправке вопроса %s (%s): %s", name, chat_id, e)
+            import time; time.sleep(1)
+
+def build_digest(team_members: dict, for_date: date) -> str:
+    answers = load_answers_from_redis(for_date)
+    lines = ["📝 Статусы на отчётное время:\n"]
+    total = len(team_members)
+    responded = 0
+
+    for chat_id, name in team_members.items():
+        payload = answers.get(str(chat_id))
+        if payload:
+            lines.append(f"— {name}:\n{payload.get('summary','')}\n")
+            responded += 1
+        else:
+            lines.append(f"— {name}:\n- (прочерк)\n")
+
+    lines.append(f"Отчитались: {responded}/{total}")
+    return "\n".join(lines)
+
+def send_summary(team_id: int):
+    log.info("Отправка отчёта команде %s", team_id)
+    today = datetime.now(TZ).date()
+    digest = build_digest(TEAMS[team_id]["members"], today)
+    managers = TEAMS[team_id].get("managers") or [TEAMS[team_id].get("manager")]
+    for mid in managers:
+        try:
+            r = tg_send(mid, digest)
+            if r.ok:
+                log.info("Отчёт отправлен менеджеру %s (team %s)", mid, team_id)
+            else:
+                log.error("Ошибка отправки отчёта менеджеру %s: %s %s", mid, r.status_code, r.text)
+        except Exception as e:
+            log.error("Исключение при отправке отчёта менеджеру %s: %s", mid, e)
+
+# ---------- Планировщик ----------
+def start_scheduler():
+    sched = BackgroundScheduler(timezone=TZ)
+    # вопросы Пн‑Пт 09:00
+    sched.add_job(send_questions, CronTrigger(day_of_week="mon-fri", hour=9,  minute=0))
+    # отчёты: команде 1 — 09:30; команде 2 — 11:00
+    sched.add_job(lambda: send_summary(1), CronTrigger(day_of_week="mon-fri", hour=9,  minute=30))
+    sched.add_job(lambda: send_summary(2), CronTrigger(day_of_week="mon-fri", hour=11, minute=0))
+    sched.start()
+    log.info("APScheduler started")
+
+start_scheduler()

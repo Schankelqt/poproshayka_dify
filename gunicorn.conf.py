@@ -1,10 +1,6 @@
 # gunicorn.conf.py
-import os
-
-bind = f"0.0.0.0:{os.getenv('PORT', '10000')}"
-workers = 2
-threads = 2
+workers = 1            # один воркер, чтобы задачи не дублировались
+threads = 4
 timeout = 120
-accesslog = "-"
-errorlog = "-"
-loglevel = "info"
+bind = "0.0.0.0:10000"  # Render сам подставит PORT, игнорируется gunicorn'ом
+# Render передаёт порт через $PORT — gunicorn это понимает сам
